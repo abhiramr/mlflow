@@ -3,25 +3,31 @@ from collections import namedtuple
 
 from mlflow.models.evaluation import (
     evaluate,
-    EvaluationDataset,
     EvaluationResult,
     ModelEvaluator,
     EvaluationArtifact,
-    EvaluationMetrics,
 )
+from mlflow.models.evaluation.artifacts import ImageEvaluationArtifact
 from mlflow.models.evaluation.base import (
+    EvaluationDataset,
     _normalize_evaluators_and_evaluator_config_args as _normalize_config,
 )
 import hashlib
 from mlflow.models.evaluation.base import _start_run_or_reuse_active_run
 import sklearn
 import os
+import sklearn.compose
 import sklearn.datasets
+import sklearn.impute
 import sklearn.linear_model
+import sklearn.pipeline
+import sklearn.preprocessing
 import pytest
 import numpy as np
 import pandas as pd
 from unittest import mock
+from PIL import ImageChops, Image
+import io
 from mlflow.utils.file_utils import TempDir
 from mlflow_test_plugin.dummy_evaluator import Array2DEvaluationArtifact
 from mlflow.models.evaluation.evaluator_registry import _model_evaluation_registry
@@ -99,27 +105,113 @@ def spark_session():
 def iris_dataset():
     X, y = get_iris()
     eval_X, eval_y = X[0::3], y[0::3]
-    return EvaluationDataset(data=eval_X, labels=eval_y, name="iris_dataset")
+    constructor_args = {"data": eval_X, "targets": eval_y, "name": "iris_dataset"}
+    ds = EvaluationDataset(**constructor_args)
+    ds._constructor_args = constructor_args
+    return ds
 
 
 @pytest.fixture(scope="module")
 def diabetes_dataset():
     X, y = get_diabetes_dataset()
     eval_X, eval_y = X[0::3], y[0::3]
-    return EvaluationDataset(data=eval_X, labels=eval_y, name="diabetes_dataset")
+    constructor_args = {"data": eval_X, "targets": eval_y, "name": "diabetes_dataset"}
+    ds = EvaluationDataset(**constructor_args)
+    ds._constructor_args = constructor_args
+    return ds
 
 
 @pytest.fixture(scope="module")
 def diabetes_spark_dataset():
     spark_df = get_diabetes_spark_dataset().sample(fraction=0.3, seed=1)
-    return EvaluationDataset(data=spark_df, labels="label", name="diabetes_spark_dataset")
+    constructor_args = {"data": spark_df, "targets": "label", "name": "diabetes_spark_dataset"}
+    ds = EvaluationDataset(**constructor_args)
+    ds._constructor_args = constructor_args
+    return ds
 
 
 @pytest.fixture(scope="module")
 def breast_cancer_dataset():
     X, y = get_breast_cancer_dataset()
     eval_X, eval_y = X[0::3], y[0::3]
-    return EvaluationDataset(data=eval_X, labels=eval_y, name="breast_cancer_dataset")
+    constructor_args = {"data": eval_X, "targets": eval_y, "name": "breast_cancer_dataset"}
+    ds = EvaluationDataset(**constructor_args)
+    ds._constructor_args = constructor_args
+    return ds
+
+
+def get_pipeline_model_dataset():
+    """
+    The dataset tweaks the IRIS dataset by changing its first 2 features into categorical features,
+    and replace some feature values with NA values.
+    The dataset is prepared for a pipeline model, see `pipeline_model_uri`.
+    """
+    X, y = get_iris()
+
+    def convert_num_to_label(x):
+        return f"v_{round(x)}"
+
+    f1 = np.array(list(map(convert_num_to_label, X[:, 0])))
+    f2 = np.array(list(map(convert_num_to_label, X[:, 1])))
+    f3 = X[:, 2]
+    f4 = X[:, 3]
+
+    f1[0::8] = None
+    f2[1::8] = None
+    f3[2::8] = np.nan
+    f4[3::8] = np.nan
+
+    data = pd.DataFrame(
+        {
+            "f1": f1,
+            "f2": f2,
+            "f3": f3,
+            "f4": f4,
+            "y": y,
+        }
+    )
+    return data, "y"
+
+
+@pytest.fixture
+def pipeline_model_uri():
+    """
+    Create a pipeline model that transforms and trains on the dataset returned by
+    `get_pipeline_model_dataset`. The pipeline model imputes the missing values in
+    input dataset, encodes categorical features, and then trains a logistic regression
+    model.
+    """
+    data, target_col = get_pipeline_model_dataset()
+    X = data.drop(target_col, axis=1)
+    y = data[target_col].to_numpy()
+
+    encoder = sklearn.preprocessing.OrdinalEncoder()
+    str_imputer = sklearn.impute.SimpleImputer(missing_values=None, strategy="most_frequent")
+    num_imputer = sklearn.impute.SimpleImputer(missing_values=np.nan, strategy="mean")
+    preproc_pipeline = sklearn.pipeline.Pipeline(
+        [
+            ("imputer", str_imputer),
+            ("encoder", encoder),
+        ]
+    )
+
+    pipeline = sklearn.pipeline.Pipeline(
+        [
+            (
+                "transformer",
+                sklearn.compose.make_column_transformer(
+                    (preproc_pipeline, ["f1", "f2"]),
+                    (num_imputer, ["f3", "f4"]),
+                ),
+            ),
+            ("clf", sklearn.linear_model.LogisticRegression()),
+        ]
+    )
+    pipeline.fit(X, y)
+
+    with mlflow.start_run():
+        model_info = mlflow.sklearn.log_model(pipeline, "pipeline_model")
+        return model_info.model_uri
 
 
 @pytest.fixture
@@ -200,8 +292,7 @@ def iris_pandas_df_dataset():
             "y": eval_y,
         }
     )
-    labels = "y"
-    return EvaluationDataset(data=data, labels=labels, name="iris_pandas_df_dataset")
+    return EvaluationDataset(data=data, targets="y", name="iris_pandas_df_dataset")
 
 
 def test_classifier_evaluate(multiclass_logistic_regressor_model_uri, iris_dataset):
@@ -216,29 +307,59 @@ def test_classifier_evaluate(multiclass_logistic_regressor_model_uri, iris_datas
         "accuracy_score_on_iris_dataset": expected_accuracy_score,
     }
 
-    expected_artifact = confusion_matrix(y_true, y_pred)
+    expected_csv_artifact = confusion_matrix(y_true, y_pred)
+    cm_figure = sklearn.metrics.ConfusionMatrixDisplay.from_predictions(y_true, y_pred).figure_
+    img_buf = io.BytesIO()
+    cm_figure.savefig(img_buf)
+    img_buf.seek(0)
+    expected_image_artifact = Image.open(img_buf)
 
     with mlflow.start_run() as run:
         eval_result = evaluate(
-            model=classifier_model,
+            classifier_model,
+            iris_dataset._constructor_args["data"],
             model_type="classifier",
-            dataset=iris_dataset,
-            run_id=None,
+            targets=iris_dataset._constructor_args["targets"],
+            dataset_name=iris_dataset.name,
             evaluators="dummy_evaluator",
         )
 
-    artifact_name = "confusion_matrix_on_iris_dataset.csv"
-    saved_artifact_path = get_local_artifact_path(run.info.run_id, artifact_name)
+    csv_artifact_name = "confusion_matrix_on_iris_dataset"
+    saved_csv_artifact_path = get_local_artifact_path(run.info.run_id, csv_artifact_name + ".csv")
+
+    png_artifact_name = "confusion_matrix_image_on_iris_dataset"
+    saved_png_artifact_path = get_local_artifact_path(run.info.run_id, png_artifact_name) + ".png"
 
     _, saved_metrics, _, saved_artifacts = get_run_data(run.info.run_id)
     assert saved_metrics == expected_saved_metrics
-    assert saved_artifacts == [artifact_name]
+    assert set(saved_artifacts) == {csv_artifact_name + ".csv", png_artifact_name + ".png"}
 
     assert eval_result.metrics == expected_metrics
-    confusion_matrix_artifact = eval_result.artifacts[artifact_name]
-    assert np.array_equal(confusion_matrix_artifact.content, expected_artifact)
-    assert confusion_matrix_artifact.uri == get_artifact_uri(run.info.run_id, artifact_name)
-    assert np.array_equal(confusion_matrix_artifact.load(saved_artifact_path), expected_artifact)
+    confusion_matrix_artifact = eval_result.artifacts[csv_artifact_name]
+    assert np.array_equal(confusion_matrix_artifact.content, expected_csv_artifact)
+    assert confusion_matrix_artifact.uri == get_artifact_uri(
+        run.info.run_id, csv_artifact_name + ".csv"
+    )
+    assert np.array_equal(
+        confusion_matrix_artifact._load(saved_csv_artifact_path), expected_csv_artifact
+    )
+    confusion_matrix_image_artifact = eval_result.artifacts[png_artifact_name]
+    assert (
+        ImageChops.difference(
+            confusion_matrix_image_artifact.content, expected_image_artifact
+        ).getbbox()
+        is None
+    )
+    assert confusion_matrix_image_artifact.uri == get_artifact_uri(
+        run.info.run_id, png_artifact_name + ".png"
+    )
+    assert (
+        ImageChops.difference(
+            confusion_matrix_image_artifact._load(saved_png_artifact_path),
+            expected_image_artifact,
+        ).getbbox()
+        is None
+    )
 
     with TempDir() as temp_dir:
         temp_dir_path = temp_dir.path()
@@ -248,29 +369,55 @@ def test_classifier_evaluate(multiclass_logistic_regressor_model_uri, iris_datas
             assert json.load(fp) == eval_result.metrics
 
         with open(temp_dir.path("artifacts_metadata.json"), "r") as fp:
-            assert json.load(fp) == {
-                "confusion_matrix_on_iris_dataset.csv": {
-                    "uri": confusion_matrix_artifact.uri,
-                    "class_name": "mlflow_test_plugin.dummy_evaluator.Array2DEvaluationArtifact",
-                }
+            json_dict = json.load(fp)
+            assert "confusion_matrix_on_iris_dataset" in json_dict
+            assert json_dict["confusion_matrix_on_iris_dataset"] == {
+                "uri": confusion_matrix_artifact.uri,
+                "class_name": "mlflow_test_plugin.dummy_evaluator.Array2DEvaluationArtifact",
             }
 
-        assert os.listdir(temp_dir.path("artifacts")) == ["confusion_matrix_on_iris_dataset.csv"]
+            assert "confusion_matrix_image_on_iris_dataset" in json_dict
+            assert json_dict["confusion_matrix_image_on_iris_dataset"] == {
+                "uri": confusion_matrix_image_artifact.uri,
+                "class_name": "mlflow.models.evaluation.artifacts.ImageEvaluationArtifact",
+            }
+
+        assert set(os.listdir(temp_dir.path("artifacts"))) == {
+            "confusion_matrix_on_iris_dataset.csv",
+            "confusion_matrix_image_on_iris_dataset.png",
+        }
 
         loaded_eval_result = EvaluationResult.load(temp_dir_path)
         assert loaded_eval_result.metrics == eval_result.metrics
-        loaded_confusion_matrix_artifact = loaded_eval_result.artifacts[artifact_name]
+        loaded_confusion_matrix_artifact = loaded_eval_result.artifacts[csv_artifact_name]
         assert confusion_matrix_artifact.uri == loaded_confusion_matrix_artifact.uri
         assert np.array_equal(
             confusion_matrix_artifact.content,
             loaded_confusion_matrix_artifact.content,
         )
+        loaded_confusion_matrix_image_artifact = loaded_eval_result.artifacts[png_artifact_name]
+        assert confusion_matrix_image_artifact.uri == loaded_confusion_matrix_image_artifact.uri
+        assert (
+            ImageChops.difference(
+                confusion_matrix_image_artifact.content,
+                loaded_confusion_matrix_image_artifact.content,
+            ).getbbox()
+            is None
+        )
 
         new_confusion_matrix_artifact = Array2DEvaluationArtifact(uri=confusion_matrix_artifact.uri)
-        new_confusion_matrix_artifact.load()
+        new_confusion_matrix_artifact._load()
         assert np.array_equal(
             confusion_matrix_artifact.content,
             new_confusion_matrix_artifact.content,
+        )
+        new_confusion_matrix_image_artifact = ImageEvaluationArtifact(
+            uri=confusion_matrix_image_artifact.uri
+        )
+        new_confusion_matrix_image_artifact._load()
+        assert np.array_equal(
+            confusion_matrix_image_artifact.content,
+            new_confusion_matrix_image_artifact.content,
         )
 
 
@@ -292,10 +439,11 @@ def test_regressor_evaluate(linear_regressor_model_uri, diabetes_dataset):
     for model in [regressor_model, linear_regressor_model_uri]:
         with mlflow.start_run() as run:
             eval_result = evaluate(
-                model=model,
+                model,
+                diabetes_dataset._constructor_args["data"],
                 model_type="regressor",
-                dataset=diabetes_dataset,
-                run_id=None,
+                targets=diabetes_dataset._constructor_args["targets"],
+                dataset_name=diabetes_dataset.name,
                 evaluators="dummy_evaluator",
             )
         _, saved_metrics, _, _ = get_run_data(run.info.run_id)
@@ -303,12 +451,49 @@ def test_regressor_evaluate(linear_regressor_model_uri, diabetes_dataset):
         assert eval_result.metrics == expected_metrics
 
 
+def test_pandas_df_regressor_evaluation(linear_regressor_model_uri):
+
+    data = sklearn.datasets.load_diabetes()
+    df = pd.DataFrame(data.data, columns=data.feature_names)
+    df["y"] = data.target
+
+    regressor_model = mlflow.pyfunc.load_model(linear_regressor_model_uri)
+
+    dataset_name = "diabetes_pd"
+
+    for model in [regressor_model, linear_regressor_model_uri]:
+        with mlflow.start_run() as run:
+            eval_result = evaluate(
+                model,
+                data=df,
+                targets="y",
+                model_type="regressor",
+                dataset_name=dataset_name,
+                evaluators=["default"],
+            )
+        _, saved_metrics, _, _ = get_run_data(run.info.run_id)
+
+    augment_name = f"_on_data_{dataset_name}"
+    for k, v in eval_result.metrics.items():
+        assert v == saved_metrics[f"{k}{augment_name}"]
+
+
 def test_dataset_name():
     X, y = get_iris()
-    d1 = EvaluationDataset(data=X, labels=y, name="a1")
+    d1 = EvaluationDataset(data=X, targets=y, name="a1")
     assert d1.name == "a1"
-    d2 = EvaluationDataset(data=X, labels=y)
+    d2 = EvaluationDataset(data=X, targets=y)
     assert d2.name == d2.hash
+
+
+def test_dataset_metadata():
+    X, y = get_iris()
+    d1 = EvaluationDataset(data=X, targets=y, name="a1", path="/path/to/a1")
+    assert d1._metadata == {
+        "hash": "6bdf4e119bf1a37e7907dfd9f0e68733",
+        "name": "a1",
+        "path": "/path/to/a1",
+    }
 
 
 def test_gen_md5_for_arraylike_obj():
@@ -334,54 +519,64 @@ def test_dataset_hash(iris_dataset, iris_pandas_df_dataset, diabetes_spark_datas
     assert diabetes_spark_dataset.hash == "e646b03e976240bd0c79c6bcc1ae0bda"
 
 
-def test_datasset_with_pandas_dataframe():
-    data = pd.DataFrame({"f1": [1, 2], "f2": [3, 4], "label": [0, 1]})
-    eval_dataset = EvaluationDataset(data=data, labels="label")
+def test_dataset_with_pandas_dataframe():
+    data = pd.DataFrame({"f1": [1, 2], "f2": [3, 4], "f3": [5, 6], "label": [0, 1]})
+    eval_dataset = EvaluationDataset(data=data, targets="label")
 
-    assert list(eval_dataset.features_data.columns) == ["f1", "f2"]
+    assert list(eval_dataset.features_data.columns) == ["f1", "f2", "f3"]
     assert np.array_equal(eval_dataset.features_data.f1.to_numpy(), [1, 2])
     assert np.array_equal(eval_dataset.features_data.f2.to_numpy(), [3, 4])
+    assert np.array_equal(eval_dataset.features_data.f3.to_numpy(), [5, 6])
     assert np.array_equal(eval_dataset.labels_data, [0, 1])
 
+    eval_dataset2 = EvaluationDataset(data=data, targets="label", feature_names=["f3", "f2"])
+    assert list(eval_dataset2.features_data.columns) == ["f3", "f2"]
+    assert np.array_equal(eval_dataset2.features_data.f2.to_numpy(), [3, 4])
+    assert np.array_equal(eval_dataset2.features_data.f3.to_numpy(), [5, 6])
 
-def test_datasset_with_array_data():
+
+def test_dataset_with_array_data():
     features = [[1, 2], [3, 4]]
     labels = [0, 1]
 
     for input_data in [features, np.array(features)]:
-        eval_dataset1 = EvaluationDataset(data=input_data, labels=labels)
+        eval_dataset1 = EvaluationDataset(data=input_data, targets=labels)
         assert np.array_equal(eval_dataset1.features_data, features)
         assert np.array_equal(eval_dataset1.labels_data, labels)
         assert list(eval_dataset1.feature_names) == ["feature_1", "feature_2"]
 
+    assert EvaluationDataset(
+        data=input_data, targets=labels, feature_names=["a", "b"]
+    ).feature_names == ["a", "b"]
+
     with pytest.raises(ValueError, match="all element must has the same length"):
-        EvaluationDataset(data=[[1, 2], [3, 4, 5]], labels=labels)
+        EvaluationDataset(data=[[1, 2], [3, 4, 5]], targets=labels)
 
 
-def test_autogen_feature_names():
+def test_dataset_autogen_feature_names():
     labels = [0]
-    eval_dataset2 = EvaluationDataset(data=[list(range(9))], labels=labels)
+    eval_dataset2 = EvaluationDataset(data=[list(range(9))], targets=labels)
     assert eval_dataset2.feature_names == [f"feature_{i + 1}" for i in range(9)]
 
-    eval_dataset2 = EvaluationDataset(data=[list(range(10))], labels=labels)
+    eval_dataset2 = EvaluationDataset(data=[list(range(10))], targets=labels)
     assert eval_dataset2.feature_names == [f"feature_{i + 1:02d}" for i in range(10)]
 
-    eval_dataset2 = EvaluationDataset(data=[list(range(99))], labels=labels)
+    eval_dataset2 = EvaluationDataset(data=[list(range(99))], targets=labels)
     assert eval_dataset2.feature_names == [f"feature_{i + 1:02d}" for i in range(99)]
 
-    eval_dataset2 = EvaluationDataset(data=[list(range(100))], labels=labels)
+    eval_dataset2 = EvaluationDataset(data=[list(range(100))], targets=labels)
     assert eval_dataset2.feature_names == [f"feature_{i + 1:03d}" for i in range(100)]
 
     with pytest.raises(
         ValueError, match="features example rows must be the same length with labels array"
     ):
-        EvaluationDataset(data=[[1, 2], [3, 4]], labels=[1, 2, 3])
+        EvaluationDataset(data=[[1, 2], [3, 4]], targets=[1, 2, 3])
 
 
-def test_spark_df_dataset(spark_session):
+def test_dataset_from_spark_df(spark_session):
     spark_df = spark_session.createDataFrame([(1.0, 2.0, 3.0)] * 10, ["f1", "f2", "y"])
     with mock.patch.object(EvaluationDataset, "SPARK_DATAFRAME_LIMIT", 5):
-        dataset = EvaluationDataset(spark_df, "y")
+        dataset = EvaluationDataset(spark_df, targets="y")
         assert list(dataset.features_data.columns) == ["f1", "f2"]
         assert list(dataset.features_data["f1"]) == [1.0] * 5
         assert list(dataset.features_data["f2"]) == [2.0] * 5
@@ -437,7 +632,7 @@ class FakeEvauator2(ModelEvaluator):
 
 
 class FakeArtifact1(EvaluationArtifact):
-    def save(self, output_artifact_path):
+    def _save(self, output_artifact_path):
         raise RuntimeError()
 
     def _load_content_from_file(self, local_artifact_path):
@@ -445,7 +640,7 @@ class FakeArtifact1(EvaluationArtifact):
 
 
 class FakeArtifact2(EvaluationArtifact):
-    def save(self, output_artifact_path):
+    def _save(self, output_artifact_path):
         raise RuntimeError()
 
     def _load_content_from_file(self, local_artifact_path):
@@ -458,7 +653,7 @@ def test_evaluator_interface(multiclass_logistic_regressor_model_uri, iris_datas
     ):
         evaluator1_config = {"eval1_confg_a": 3, "eval1_confg_b": 4}
         evaluator1_return_value = EvaluationResult(
-            metrics=EvaluationMetrics({"m1": 5, "m2": 6}),
+            metrics={"m1": 5, "m2": 6},
             artifacts={"a1": FakeArtifact1(uri="uri1"), "a2": FakeArtifact2(uri="uri2")},
         )
         with mock.patch.object(
@@ -472,10 +667,11 @@ def test_evaluator_interface(multiclass_logistic_regressor_model_uri, iris_datas
                     match="The model could not be evaluated by any of the registered evaluators",
                 ):
                     evaluate(
-                        model=multiclass_logistic_regressor_model_uri,
+                        multiclass_logistic_regressor_model_uri,
+                        data=iris_dataset._constructor_args["data"],
                         model_type="classifier",
-                        dataset=iris_dataset,
-                        run_id=None,
+                        targets=iris_dataset._constructor_args["targets"],
+                        dataset_name=iris_dataset.name,
                         evaluators="test_evaluator1",
                         evaluator_config=evaluator1_config,
                     )
@@ -491,12 +687,14 @@ def test_evaluator_interface(multiclass_logistic_regressor_model_uri, iris_datas
             classifier_model = mlflow.pyfunc.load_model(multiclass_logistic_regressor_model_uri)
             with mlflow.start_run() as run:
                 eval1_result = evaluate(
-                    model=classifier_model,
+                    classifier_model,
+                    iris_dataset._constructor_args["data"],
                     model_type="classifier",
-                    dataset=iris_dataset,
-                    run_id=None,
+                    targets=iris_dataset._constructor_args["targets"],
+                    dataset_name=iris_dataset.name,
                     evaluators="test_evaluator1",
                     evaluator_config=evaluator1_config,
+                    custom_metrics=None,
                 )
                 assert eval1_result.metrics == evaluator1_return_value.metrics
                 assert eval1_result.artifacts == evaluator1_return_value.artifacts
@@ -510,6 +708,7 @@ def test_evaluator_interface(multiclass_logistic_regressor_model_uri, iris_datas
                     dataset=iris_dataset,
                     run_id=run.info.run_id,
                     evaluator_config=evaluator1_config,
+                    custom_metrics=None,
                 )
 
 
@@ -522,10 +721,10 @@ def test_evaluate_with_multi_evaluators(multiclass_logistic_regressor_model_uri,
         evaluator1_config = {"eval1_confg": 3}
         evaluator2_config = {"eval2_confg": 4}
         evaluator1_return_value = EvaluationResult(
-            metrics=EvaluationMetrics({"m1": 5}), artifacts={"a1": FakeArtifact1(uri="uri1")}
+            metrics={"m1": 5}, artifacts={"a1": FakeArtifact1(uri="uri1")}
         )
         evaluator2_return_value = EvaluationResult(
-            metrics=EvaluationMetrics({"m2": 6}), artifacts={"a2": FakeArtifact2(uri="uri2")}
+            metrics={"m2": 6}, artifacts={"a2": FakeArtifact2(uri="uri2")}
         )
 
         # evaluators = None is the case evaluators unspecified, it should fetch all registered
@@ -544,10 +743,11 @@ def test_evaluate_with_multi_evaluators(multiclass_logistic_regressor_model_uri,
                 classifier_model = mlflow.pyfunc.load_model(multiclass_logistic_regressor_model_uri)
                 with mlflow.start_run() as run:
                     eval_result = evaluate(
-                        model=classifier_model,
+                        classifier_model,
+                        iris_dataset._constructor_args["data"],
                         model_type="classifier",
-                        dataset=iris_dataset,
-                        run_id=None,
+                        targets=iris_dataset._constructor_args["targets"],
+                        dataset_name=iris_dataset.name,
                         evaluators=evaluators,
                         evaluator_config={
                             "test_evaluator1": evaluator1_config,
@@ -571,6 +771,7 @@ def test_evaluate_with_multi_evaluators(multiclass_logistic_regressor_model_uri,
                         dataset=iris_dataset,
                         run_id=run.info.run_id,
                         evaluator_config=evaluator1_config,
+                        custom_metrics=None,
                     )
                     mock_can_evaluate2.assert_called_once_with(
                         model_type="classifier",
@@ -582,33 +783,22 @@ def test_evaluate_with_multi_evaluators(multiclass_logistic_regressor_model_uri,
                         dataset=iris_dataset,
                         run_id=run.info.run_id,
                         evaluator_config=evaluator2_config,
+                        custom_metrics=None,
                     )
 
 
 def test_start_run_or_reuse_active_run():
-    with _start_run_or_reuse_active_run(run_id=None) as run_id:
-        assert mlflow.active_run().info.run_id == run_id
-
-    with mlflow.start_run() as run:
-        pass
-    previous_run_id = run.info.run_id
-
-    with _start_run_or_reuse_active_run(run_id=previous_run_id) as run_id:
-        assert previous_run_id == run_id
+    with _start_run_or_reuse_active_run() as run_id:
         assert mlflow.active_run().info.run_id == run_id
 
     with mlflow.start_run() as run:
         active_run_id = run.info.run_id
 
-        with _start_run_or_reuse_active_run(run_id=None) as run_id:
+        with _start_run_or_reuse_active_run() as run_id:
             assert run_id == active_run_id
 
-        with _start_run_or_reuse_active_run(run_id=active_run_id) as run_id:
+        with _start_run_or_reuse_active_run() as run_id:
             assert run_id == active_run_id
-
-        with pytest.raises(ValueError, match="An active run exists"):
-            with _start_run_or_reuse_active_run(run_id=previous_run_id):
-                pass
 
 
 def test_normalize_evaluators_and_evaluator_config_args():

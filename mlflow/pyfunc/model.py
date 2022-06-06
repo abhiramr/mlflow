@@ -25,6 +25,8 @@ from mlflow.utils.environment import (
     _CONDA_ENV_FILE_NAME,
     _REQUIREMENTS_FILE_NAME,
     _CONSTRAINTS_FILE_NAME,
+    _PYTHON_ENV_FILE_NAME,
+    _PythonEnv,
 )
 from mlflow.utils.requirements_utils import _get_pinned_requirement
 from mlflow.utils.file_utils import write_to
@@ -71,7 +73,7 @@ class PythonModel:
         """
         Loads artifacts from the specified :class:`~PythonModelContext` that can be used by
         :func:`~PythonModel.predict` when evaluating inputs. When loading an MLflow model with
-        :func:`~load_pyfunc`, this method is called as soon as the :class:`~PythonModel` is
+        :func:`~load_model`, this method is called as soon as the :class:`~PythonModel` is
         constructed.
 
         The same :class:`~PythonModelContext` will also be available during calls to
@@ -237,6 +239,8 @@ def _save_model_with_class_artifacts_params(
 
     # Save `requirements.txt`
     write_to(os.path.join(path, _REQUIREMENTS_FILE_NAME), "\n".join(pip_requirements))
+
+    _PythonEnv.current().to_yaml(os.path.join(path, _PYTHON_ENV_FILE_NAME))
 
 
 def _load_pyfunc(model_path):

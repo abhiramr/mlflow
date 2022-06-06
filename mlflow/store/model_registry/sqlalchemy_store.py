@@ -110,7 +110,7 @@ class SqlAlchemyStore(AbstractStore):
             SqlRegisteredModel.__tablename__,
             SqlModelVersion.__tablename__,
         ]
-        if any([table not in inspected_tables for table in expected_tables]):
+        if any(table not in inspected_tables for table in expected_tables):
             # TODO: Replace the MlflowException with the following line once it's possible to run
             # the registry against a different DB than the tracking server:
             # mlflow.store.db.utils._initialize_tables(self.engine)
@@ -186,7 +186,7 @@ class SqlAlchemyStore(AbstractStore):
                 return registered_model.to_mlflow_entity()
             except sqlalchemy.exc.IntegrityError as e:
                 raise MlflowException(
-                    "Registered Model (name={}) already exists. " "Error: {}".format(name, str(e)),
+                    "Registered Model (name={}) already exists. Error: {}".format(name, str(e)),
                     RESOURCE_ALREADY_EXISTS,
                 )
 
@@ -570,7 +570,7 @@ class SqlAlchemyStore(AbstractStore):
 
         if len(versions) == 0:
             raise MlflowException(
-                "Model Version (name={}, version={}) " "not found".format(name, version),
+                "Model Version (name={}, version={}) not found".format(name, version),
                 RESOURCE_DOES_NOT_EXIST,
             )
         if len(versions) > 1:
@@ -640,7 +640,7 @@ class SqlAlchemyStore(AbstractStore):
         :param version: Registered model version.
         :param new_stage: New desired stage for this model version.
         :param archive_existing_versions: If this flag is set to ``True``, all existing model
-            versions in the stage will be automically moved to the "archived" stage. Only valid
+            versions in the stage will be automatically moved to the "archived" stage. Only valid
             when ``stage`` is ``"staging"`` or ``"production"`` otherwise an error will be raised.
 
         :return: A single :py:class:`mlflow.entities.model_registry.ModelVersion` object.

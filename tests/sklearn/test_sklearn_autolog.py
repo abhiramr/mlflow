@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import re
+import contextlib
 from packaging.version import Version
 
 import sklearn
@@ -31,6 +32,7 @@ from mlflow.sklearn.utils import (
     _get_arg_names,
     _log_child_runs_info,
 )
+from mlflow.tracking.client import MlflowClient
 from mlflow.utils import _truncate_dict
 from mlflow.utils.mlflow_tags import MLFLOW_AUTOLOGGING
 from mlflow.utils.validation import (
@@ -45,8 +47,6 @@ TRAINING_SCORE = "training_score"
 ESTIMATOR_CLASS = "estimator_class"
 ESTIMATOR_NAME = "estimator_name"
 MODEL_DIR = "model"
-
-pytestmark = pytest.mark.large
 
 
 def get_iris():
@@ -155,7 +155,7 @@ def test_autolog_throws_error_with_negative_max_tuning_runs():
 
 
 @pytest.mark.parametrize(
-    "max_tuning_runs, total_runs, output_statment",
+    "max_tuning_runs, total_runs, output_statement",
     [
         (0, 4, "Logging no runs, all will be omitted"),
         (0, 1, "Logging no runs, one run will be omitted"),
@@ -165,11 +165,11 @@ def test_autolog_throws_error_with_negative_max_tuning_runs():
         (2, 5, "Logging the 2 best runs, 3 runs will be omitted"),
     ],
 )
-def test_autolog_max_tuning_runs_logs_info_correctly(max_tuning_runs, total_runs, output_statment):
+def test_autolog_max_tuning_runs_logs_info_correctly(max_tuning_runs, total_runs, output_statement):
     with mock.patch("mlflow.sklearn.utils._logger.info") as mock_info:
         _log_child_runs_info(max_tuning_runs, total_runs)
         mock_info.assert_called_once()
-        mock_info.called_once_with(output_statment)
+        mock_info.called_once_with(output_statement)
 
 
 @pytest.mark.skipif(
@@ -381,13 +381,23 @@ def test_meta_estimator():
     assert_predict_equal(load_model_by_run_id(run_id), model, X)
 
 
+def disable_validate_params(cls):
+    return (
+        mock.patch(f"{cls}._validate_params")
+        if Version(sklearn.__version__) >= Version("1.2.dev0")
+        else contextlib.nullcontext()
+    )
+
+
 def test_get_params_returns_dict_that_has_more_keys_than_max_params_tags_per_batch():
     mlflow.sklearn.autolog()
 
     large_params = {str(i): str(i) for i in range(MAX_PARAMS_TAGS_PER_BATCH + 1)}
     X, y = get_iris()
 
-    with mock.patch("sklearn.cluster.KMeans.get_params", return_value=large_params):
+    with disable_validate_params("sklearn.cluster.KMeans"), mock.patch(
+        "sklearn.cluster.KMeans.get_params", return_value=large_params
+    ):
         with mlflow.start_run() as run:
             model = sklearn.cluster.KMeans()
             model.fit(X, y)
@@ -421,9 +431,9 @@ def test_get_params_returns_dict_whose_key_or_value_exceeds_length_limit(long_pa
 
     X, y = get_iris()
 
-    with mock.patch("sklearn.cluster.KMeans.get_params", return_value=long_params), mock.patch(
-        "mlflow.utils._logger.warning"
-    ) as mock_warning, mlflow.start_run() as run:
+    with disable_validate_params("sklearn.cluster.KMeans"), mock.patch(
+        "sklearn.cluster.KMeans.get_params", return_value=long_params
+    ), mock.patch("mlflow.utils._logger.warning") as mock_warning, mlflow.start_run() as run:
         model = sklearn.cluster.KMeans()
         model.fit(X, y)
 
@@ -980,7 +990,6 @@ def test_autolog_does_not_throw_when_infer_signature_fails():
     assert "signature" not in model_conf.to_dict()
 
 
-@pytest.mark.large
 @pytest.mark.parametrize("log_input_examples", [True, False])
 @pytest.mark.parametrize("log_model_signatures", [True, False])
 def test_autolog_configuration_options(log_input_examples, log_model_signatures):
@@ -997,7 +1006,6 @@ def test_autolog_configuration_options(log_input_examples, log_model_signatures)
     assert ("signature" in model_conf.to_dict()) == log_model_signatures
 
 
-@pytest.mark.large
 @pytest.mark.parametrize("log_models", [True, False])
 def test_sklearn_autolog_log_models_configuration(log_models):
     X, y = get_iris()
@@ -1012,7 +1020,6 @@ def test_sklearn_autolog_log_models_configuration(log_models):
     assert (MODEL_DIR in artifacts) == log_models
 
 
-@pytest.mark.large
 def test_autolog_does_not_capture_runs_for_preprocessing_or_feature_manipulation_estimators():
     """
     Verifies that preprocessing and feature manipulation estimators, which represent data
@@ -1054,7 +1061,6 @@ def test_autolog_does_not_capture_runs_for_preprocessing_or_feature_manipulation
     assert len(artifacts) == 0
 
 
-@pytest.mark.large
 def test_autolog_produces_expected_results_for_estimator_when_parent_also_defines_fit():
     """
     Test to prevent recurrences of https://github.com/mlflow/mlflow/issues/3574
@@ -1174,6 +1180,63 @@ def test_eval_and_log_metrics_for_binary_classifier():
             multi_class="ovo",
         )
     assert eval_metrics == expected_metrics
+
+    eval_artifacts = []
+    if _is_plotting_supported():
+        eval_artifacts.extend(
+            [
+                "{}.png".format("val_confusion_matrix"),
+                "{}.png".format("val_roc_curve"),
+                "{}.png".format("val_precision_recall_curve"),
+            ]
+        )
+
+    # Check that logged artifacts/metrics are the same as the ones returned by the method
+    run_id = run.info.run_id
+    _, metrics, _, artifacts = get_run_data(run_id)
+
+    assert metrics == eval_metrics
+    assert sorted(artifacts) == sorted(eval_artifacts)
+
+
+def test_eval_and_log_metrics_for_binary_classifier_with_pos_label():
+    # disable autologging so that we can check for the sole existence of eval-time metrics
+    mlflow.sklearn.autolog(disable=True)
+
+    import sklearn.ensemble
+
+    model = sklearn.ensemble.RandomForestClassifier(max_depth=2, random_state=0, n_estimators=10)
+    X, y = sklearn.datasets.load_breast_cancer(return_X_y=True)
+    X_eval = X[:-1, :]
+    y_eval = y[:-1]
+
+    with mlflow.start_run() as run:
+        model = fit_model(model, X, y, "fit")
+        eval_metrics = mlflow.sklearn.eval_and_log_metrics(
+            model=model, X=X_eval, y_true=y_eval, prefix="val_", pos_label=1
+        )
+
+    y_pred = model.predict(X_eval)
+    y_pred_prob = model.predict_proba(X_eval)
+    # For binary classification, y_score only accepts the probability of greater label
+    y_pred_prob_roc = y_pred_prob[:, 1]
+
+    expected_metrics = {
+        "val_score": model.score(X_eval, y_eval),
+        "val_accuracy_score": sklearn.metrics.accuracy_score(y_eval, y_pred),
+        "val_precision_score": sklearn.metrics.precision_score(y_eval, y_pred, pos_label=1),
+        "val_recall_score": sklearn.metrics.recall_score(y_eval, y_pred, pos_label=1),
+        "val_f1_score": sklearn.metrics.f1_score(y_eval, y_pred, pos_label=1),
+        "val_log_loss": sklearn.metrics.log_loss(y_eval, y_pred_prob),
+    }
+    if _is_metric_supported("roc_auc_score"):
+        expected_metrics["val_roc_auc_score"] = sklearn.metrics.roc_auc_score(
+            y_eval,
+            y_score=y_pred_prob_roc,
+            average="weighted",
+            multi_class="ovo",
+        )
+    assert eval_metrics == pytest.approx(expected_metrics)
 
     eval_artifacts = []
     if _is_plotting_supported():
@@ -1874,10 +1937,8 @@ def test_is_metrics_value_loggable():
     is_metric_value_loggable = mlflow.sklearn._AutologgingMetricsManager.is_metric_value_loggable
     assert is_metric_value_loggable(3)
     assert is_metric_value_loggable(3.5)
-    assert is_metric_value_loggable(np.int(3))
     assert is_metric_value_loggable(np.float32(3.5))
     assert not is_metric_value_loggable(True)
-    assert not is_metric_value_loggable(np.bool(True))
     assert not is_metric_value_loggable([1, 2])
     assert not is_metric_value_loggable(np.array([1, 2]))
 
@@ -1902,10 +1963,14 @@ def test_log_post_training_metrics_configuration():
         assert any(k.startswith(metric_name) for k in metrics.keys()) is log_post_training_metrics
 
 
-class NonPickleableKmeans(sklearn.cluster.KMeans):
-    def __init__(self, n_clusters=8, *, init="k-means++"):
-        super(NonPickleableKmeans, self).__init__(n_clusters, init=init)
+class UnpicklableKmeans(sklearn.cluster.KMeans):
+    def __init__(self, n_clusters=8):
+        super().__init__(n_clusters)
         self.generator = (i for i in range(3))
+
+    # Ignore parameter validation added in scikit-learn > 1.1.0
+    def _validate_params(self):
+        pass
 
 
 def test_autolog_print_warning_if_custom_estimator_pickling_raise_error():
@@ -1914,17 +1979,27 @@ def test_autolog_print_warning_if_custom_estimator_pickling_raise_error():
     mlflow.sklearn.autolog()
 
     with mlflow.start_run() as run, mock.patch("mlflow.sklearn._logger.warning") as mock_warning:
-        non_pickable_kmeans = NonPickleableKmeans()
+        unpicklable_kmeans = UnpicklableKmeans()
+        with pytest.raises(TypeError, match=r"(can't|cannot) pickle.+generator"):
+            pickle.dumps(unpicklable_kmeans)
 
-        with pytest.raises(TypeError, match="can't pickle generator objects"):
-            pickle.dumps(non_pickable_kmeans)
-
-        non_pickable_kmeans.fit(*get_iris())
+        unpicklable_kmeans.fit(*get_iris())
         assert any(
-            call_args[0][0].startswith("Pickling custom sklearn model NonPickleableKmeans failed")
+            call_args[0][0].startswith("Pickling custom sklearn model UnpicklableKmeans failed")
             for call_args in mock_warning.call_args_list
         )
 
     run_id = run.info.run_id
     params, metrics, tags, artifacts = get_run_data(run_id)
     assert len(params) > 0 and len(metrics) > 0 and len(tags) > 0 and artifacts == []
+
+
+def test_autolog_registering_model():
+    registered_model_name = "test_autolog_registered_model"
+
+    mlflow.sklearn.autolog(registered_model_name=registered_model_name)
+    with mlflow.start_run():
+        sklearn.cluster.KMeans().fit(*get_iris())
+
+        registered_model = MlflowClient().get_registered_model(registered_model_name)
+        assert registered_model.name == registered_model_name

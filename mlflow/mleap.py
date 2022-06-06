@@ -74,6 +74,8 @@ def log_model(
                           serialized to json using the Pandas split-oriented format. Bytes are
                           base64-encoded.
 
+    :return: A :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the
+             metadata of the logged model.
 
 
     .. code-block:: python
@@ -218,7 +220,7 @@ def add_to_model(mlflow_model, path, spark_model, sample_input):
     from py4j.protocol import Py4JError
 
     if not isinstance(spark_model, PipelineModel):
-        raise Exception("Not a PipelineModel." " MLeap can save only PipelineModels.")
+        raise Exception("Not a PipelineModel. MLeap can save only PipelineModels.")
     if sample_input is None:
         raise Exception("A sample input must be specified in order to add the MLeap flavor.")
     if not isinstance(sample_input, DataFrame):

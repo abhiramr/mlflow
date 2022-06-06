@@ -1141,7 +1141,7 @@ class MlflowClient:
         """
 
         def _is_matplotlib_figure(fig):
-            import matplotlib
+            import matplotlib.figure
 
             return isinstance(fig, matplotlib.figure.Figure)
 
@@ -2265,7 +2265,7 @@ class MlflowClient:
             # Databricks Secret Manager with scope=<scope> and key=<prefix>-workspaceid.
             workspace_host, workspace_id = get_workspace_info_from_databricks_secrets(tracking_uri)
             if not workspace_id:
-                print(
+                _logger.info(
                     "No workspace ID specified; if your Databricks workspaces share the same"
                     " host URL, you may want to specify the workspace ID (along with the host"
                     " information in the secret manager) for run lineage tracking. For more"
@@ -2354,7 +2354,7 @@ class MlflowClient:
         :param version: Registered model version.
         :param stage: New desired stage for this model version.
         :param archive_existing_versions: If this flag is set to ``True``, all existing model
-            versions in the stage will be automically moved to the "archived" stage. Only valid
+            versions in the stage will be automatically moved to the "archived" stage. Only valid
             when ``stage`` is ``"staging"`` or ``"production"`` otherwise an error will be raised.
 
         :return: A single :py:class:`mlflow.entities.model_registry.ModelVersion` object.

@@ -1,41 +1,74 @@
 import mlflow
+from mlflow.exceptions import MlflowException
 from mlflow.models.evaluation.base import (
     ModelEvaluator,
-    EvaluationMetrics,
     EvaluationResult,
 )
 from mlflow.entities.metric import Metric
+from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
 from mlflow.utils.file_utils import TempDir
 from mlflow.utils.string_utils import truncate_str_from_middle
 from mlflow.models.utils import plot_lines
-from mlflow.models.evaluation.artifacts import ImageEvaluationArtifact, CsvEvaluationArtifact
+from mlflow.models.evaluation.artifacts import (
+    ImageEvaluationArtifact,
+    CsvEvaluationArtifact,
+    NumpyEvaluationArtifact,
+    _infer_artifact_type_and_ext,
+    JsonEvaluationArtifact,
+)
 
 from sklearn import metrics as sk_metrics
+from sklearn.pipeline import Pipeline as sk_Pipeline
 import math
+import json
 from collections import namedtuple
-import numbers
+from typing import NamedTuple, Callable
+import tempfile
 import pandas as pd
 import numpy as np
+import copy
+import shutil
 import time
+import pickle
 from functools import partial
 import logging
 from packaging.version import Version
+import inspect
+import pathlib
 
 _logger = logging.getLogger(__name__)
 
 _DEFAULT_SAMPLE_ROWS_FOR_SHAP = 2000
 
 
+def _is_categorical(values):
+    """
+    Infer whether input values are categorical on best effort.
+    Return True represent they are categorical, return False represent we cannot determine result.
+    """
+    dtype_name = pd.Series(values).convert_dtypes().dtype.name.lower()
+    return dtype_name in ["category", "string", "boolean"]
+
+
+def _is_continuous(values):
+    """
+    Infer whether input values is continuous on best effort.
+    Return True represent they are continous, return False represent we cannot determine result.
+    """
+    dtype_name = pd.Series(values).convert_dtypes().dtype.name.lower()
+    return dtype_name.startswith("float")
+
+
 def _infer_model_type_by_labels(labels):
-    distinct_labels = set(labels)
-    for v in distinct_labels:
-        if not isinstance(v, numbers.Number):
-            return "classifier"
-        if not float(v).is_integer():
-            return "regressor"
-    if len(distinct_labels) > 1000 and len(distinct_labels) / len(labels) > 0.7:
+    """
+    Infer model type by target values.
+    """
+    if _is_categorical(labels):
+        return "classifier"
+    elif _is_continuous(labels):
         return "regressor"
-    return "classifier"
+    else:
+        return None  # Unknown
 
 
 def _extract_raw_model_and_predict_fn(model):
@@ -173,8 +206,8 @@ def _gen_classifier_curve(
     Generate precision-recall curve or ROC curve for classifier.
     :param is_binomial: True if it is binary classifier otherwise False
     :param y: True label values
-    :param y_probs: if binary classifer, the predicted probability for positive class.
-                    if multiclass classiifer, the predicted probabilities for all classes.
+    :param y_probs: if binary classifier, the predicted probability for positive class.
+                    if multiclass classifier, the predicted probabilities for all classes.
     :param labels: The set of labels.
     :param curve_type: "pr" or "roc"
     :return: An instance of "_Curve" which includes attributes "plot_fn", "plot_fn_args", "auc".
@@ -254,9 +287,121 @@ def _gen_classifier_curve(
 
 
 _matplotlib_config = {
-    "figure.dpi": 288,
+    "figure.dpi": 175,
     "figure.figsize": [6.0, 4.0],
+    "figure.autolayout": True,
+    "font.size": 8,
 }
+
+
+class _CustomMetric(NamedTuple):
+    """
+    A namedtuple representing a custom metric function and its properties.
+
+    function : the custom metric function
+    name : the name of the custom metric function
+    index : the index of the function in the ``custom_metrics`` argument of mlflow.evaluate
+    artifacts_dir : the path to a temporary directory to store produced artifacts of the function
+    """
+
+    function: Callable
+    name: str
+    index: int
+    artifacts_dir: str
+
+
+def _evaluate_custom_metric(custom_metric_tuple, eval_df, builtin_metrics):
+    """
+    This function calls the `custom_metric` function and performs validations on the returned
+    result to ensure that they are in the expected format. It will raise a MlflowException if
+    the result is not in the expected format.
+
+    :param custom_metric_tuple: Containing a user provided function and its index in the
+                                ``custom_metrics`` parameter of ``mlflow.evaluate``
+    :param eval_df: A Pandas dataframe object containing a prediction and a target column.
+    :param builtin_metrics: A dictionary of metrics produced by the default evaluator.
+    :return: A tuple of dictionaries. The first is a dictionary of metrics, the second is
+             a dictionary of artifacts (which can be None if the custom metric function did
+             not produce any).
+    """
+    exception_header = (
+        f"Custom metric function '{custom_metric_tuple.name}' at index {custom_metric_tuple.index}"
+        " in the `custom_metrics` parameter"
+    )
+
+    if len(inspect.signature(custom_metric_tuple.function).parameters) == 3:
+        result = custom_metric_tuple.function(
+            eval_df, builtin_metrics, custom_metric_tuple.artifacts_dir
+        )
+    else:
+        result = custom_metric_tuple.function(eval_df, builtin_metrics)
+
+    if result is None:
+        raise MlflowException(f"{exception_header} returned None.")
+
+    def __validate_metrics(metrics):
+        if not all(
+            isinstance(metric_name, str) and isinstance(metric_val, (int, float, np.number))
+            for metric_name, metric_val in metrics.items()
+        ):
+            raise MlflowException(
+                f"{exception_header} did not return metrics as a dictionary of string metric names "
+                "with numerical values."
+            )
+
+    def __validate_artifacts(artifacts):
+        if not (
+            isinstance(artifacts, dict)
+            and all(isinstance(artifacts_name, str) for artifacts_name in artifacts.keys())
+        ):
+            raise MlflowException(
+                f"{exception_header} did not return artifacts as a dictionary of string artifact "
+                "names with their corresponding objects."
+            )
+
+    if isinstance(result, dict):
+        __validate_metrics(result)
+        return result, None
+
+    if (
+        isinstance(result, tuple)
+        and len(result) == 2
+        and isinstance(result[0], dict)
+        and isinstance(result[1], dict)
+    ):
+        __validate_metrics(result[0])
+        __validate_artifacts(result[1])
+        return result
+
+    raise MlflowException(
+        f"{exception_header} did not return in an expected format. "
+        "The two acceptable return types are: \n"
+        "1. Dict[AnyStr, Union[int, float, np.number]: a dictionary of metrics \n"
+        "2. Tuple[Dict[AnyStr, Union[int, float, np.number]], Dict[AnyStr, Any]]: a"
+        "   dictionary of metrics and a dictionary of artifacts. \n"
+        "For more details refer to: "
+        "https://mlflow.org/docs/latest/python_api/mlflow.html#mlflow.evaluate",
+        error_code=INVALID_PARAMETER_VALUE,
+    )
+
+
+def _compute_df_mode_or_mean(df):
+    """
+    Compute mean (for continuous columns) and compute mode (for other columns) for the
+    input dataframe, return a dict, key is column name, value is the corresponding mode or
+    mean value, this function calls `_is_continuous` to determine whether the
+    column is continuous column.
+    """
+    continuous_cols = [c for c in df.columns if _is_continuous(df[c])]
+    df_cont = df[continuous_cols]
+    df_non_cont = df.drop(continuous_cols, axis=1)
+
+    means = {} if df_cont.empty else df_cont.mean().to_dict()
+    modes = {} if df_non_cont.empty else df_non_cont.mode().loc[0].to_dict()
+    return {**means, **modes}
+
+
+_SUPPORTED_SHAP_ALGORITHMS = ("exact", "permutation", "partition", "kernel")
 
 
 # pylint: disable=attribute-defined-outside-init
@@ -302,7 +447,7 @@ class DefaultEvaluator(ModelEvaluator):
 
         mlflow.log_artifact(artifact_file_local_path)
         artifact = ImageEvaluationArtifact(uri=mlflow.get_artifact_uri(artifact_file_name))
-        artifact.load(artifact_file_local_path)
+        artifact._load(artifact_file_local_path)
         self.artifacts[artifact_name] = artifact
 
     def _log_pandas_df_artifact(self, pandas_df, artifact_name):
@@ -314,7 +459,7 @@ class DefaultEvaluator(ModelEvaluator):
             uri=mlflow.get_artifact_uri(artifact_file_name),
             content=pandas_df,
         )
-        artifact.load(artifact_file_local_path)
+        artifact._load(artifact_file_local_path)
         self.artifacts[artifact_name] = artifact
 
     def _log_model_explainability(self):
@@ -326,21 +471,40 @@ class DefaultEvaluator(ModelEvaluator):
             #  but spark model input dataframe contains Vector type feature column
             #  which shap explainer does not support.
             #  To support this, we need expand the Vector type feature column into
-            #  multiple scaler feature columns and pass it to shap explainer.
+            #  multiple scalar feature columns and pass it to shap explainer.
             _logger.warning(
                 "Logging model explainability insights is not currently supported for PySpark "
                 "models."
             )
             return
 
-        if self.model_type == "classifier" and not all(
-            [isinstance(label, (numbers.Number, np.bool_)) for label in self.label_list]
-        ):
+        if not (np.issubdtype(self.y.dtype, np.number) or self.y.dtype == np.bool_):
+            # Note: python bool type inherits number type but np.bool_ does not inherit np.number.
             _logger.warning(
                 "Skip logging model explainability insights because it requires all label "
-                "values to be Number type."
+                "values to be numeric or boolean."
             )
             return
+
+        algorithm = self.evaluator_config.get("explainability_algorithm", None)
+        if algorithm is not None and algorithm not in _SUPPORTED_SHAP_ALGORITHMS:
+            raise ValueError(
+                f"Specified explainer algorithm {algorithm} is unsupported. Currently only "
+                f"support {','.join(_SUPPORTED_SHAP_ALGORITHMS)} algorithms."
+            )
+
+        if algorithm != "kernel":
+            feature_dtypes = (
+                list(self.X.dtypes) if isinstance(self.X, pd.DataFrame) else [self.X.dtype]
+            )
+            for feature_dtype in feature_dtypes:
+                if not np.issubdtype(feature_dtype, np.number):
+                    _logger.warning(
+                        "Skip logging model explainability insights because the shap explainer "
+                        f"{algorithm} requires all feature values to be numeric, and each feature "
+                        "column must only contain scalar values."
+                    )
+                    return
 
         try:
             import shap
@@ -363,7 +527,6 @@ class DefaultEvaluator(ModelEvaluator):
         sample_rows = self.evaluator_config.get(
             "explainability_nsamples", _DEFAULT_SAMPLE_ROWS_FOR_SHAP
         )
-        algorithm = self.evaluator_config.get("explainability_algorithm", None)
 
         truncated_feature_names = [truncate_str_from_middle(f, 20) for f in self.feature_names]
         for i, truncated_name in enumerate(truncated_feature_names):
@@ -375,44 +538,85 @@ class DefaultEvaluator(ModelEvaluator):
             f: f2 for f, f2 in zip(self.feature_names, truncated_feature_names)
         }
 
-        sampled_X = shap.sample(self.X, sample_rows)
-
-        if isinstance(sampled_X, pd.DataFrame):
+        if isinstance(self.X, pd.DataFrame):
             # For some shap explainer, the plot will use the DataFrame column names instead of
             # using feature_names argument value. So rename the dataframe column names.
-            sampled_X = sampled_X.rename(columns=truncated_feature_name_map, copy=False)
-
-        if algorithm:
-            supported_algos = ["exact", "permutation", "partition"]
-            if algorithm not in supported_algos:
-                raise ValueError(
-                    f"Specified explainer algorithm {algorithm} is unsupported. Currently only "
-                    f"support {','.join(supported_algos)} algorithms."
-                )
-            explainer = shap.Explainer(
-                self.predict_fn,
-                sampled_X,
-                feature_names=truncated_feature_names,
-                algorithm=algorithm,
-            )
+            X_df = self.X.rename(columns=truncated_feature_name_map, copy=False)
         else:
-            if self.raw_model and not is_multinomial_classifier:
-                # For mulitnomial classifier, shap.Explainer may choose Tree/Linear explainer for
-                # raw model, this case shap plot doesn't support it well, so exclude the
-                # multinomial_classifier case here.
-                explainer = shap.Explainer(
-                    self.raw_model, sampled_X, feature_names=truncated_feature_names
+            # If X is numpy array, convert to pandas dataframe.
+            X_df = pd.DataFrame(self.X, columns=truncated_feature_names)
+
+        sampled_X = shap.sample(X_df, sample_rows, random_state=0)
+
+        mode_or_mean_dict = _compute_df_mode_or_mean(X_df)
+        sampled_X = sampled_X.fillna(mode_or_mean_dict)
+
+        # shap explainer might call provided `predict_fn` with a `numpy.ndarray` type
+        # argument, this might break some model inference, so convert the argument into
+        # a pandas dataframe.
+        shap_predict_fn = lambda x: self.predict_fn(
+            pd.DataFrame(x, columns=truncated_feature_names)
+        )
+
+        try:
+            if algorithm:
+                if algorithm == "kernel":
+                    kernel_link = self.evaluator_config.get(
+                        "explainability_kernel_link", "identity"
+                    )
+                    if kernel_link not in ["identity", "logit"]:
+                        raise ValueError(
+                            "explainability_kernel_link config can only be set to 'identity' or "
+                            f"'logit', but got '{kernel_link}'."
+                        )
+                    background_X = shap.sample(X_df, sample_rows, random_state=3)
+                    background_X = background_X.fillna(mode_or_mean_dict)
+                    explainer = shap.KernelExplainer(
+                        shap_predict_fn, background_X, link=kernel_link
+                    )
+                else:
+                    explainer = shap.Explainer(
+                        shap_predict_fn,
+                        sampled_X,
+                        feature_names=truncated_feature_names,
+                        algorithm=algorithm,
+                    )
+            else:
+                if (
+                    self.raw_model
+                    and not is_multinomial_classifier
+                    and not isinstance(self.raw_model, sk_Pipeline)
+                ):
+                    # For mulitnomial classifier, shap.Explainer may choose Tree/Linear explainer
+                    # for raw model, this case shap plot doesn't support it well, so exclude the
+                    # multinomial_classifier case here.
+                    explainer = shap.Explainer(
+                        self.raw_model, sampled_X, feature_names=truncated_feature_names
+                    )
+                else:
+                    # fallback to default explainer
+                    explainer = shap.Explainer(
+                        shap_predict_fn, sampled_X, feature_names=truncated_feature_names
+                    )
+
+            _logger.info(f"Shap explainer {explainer.__class__.__name__} is used.")
+
+            if algorithm == "kernel":
+                shap_values = shap.Explanation(
+                    explainer.shap_values(sampled_X), feature_names=truncated_feature_names
                 )
             else:
-                # fallback to default explainer
-                explainer = shap.Explainer(
-                    self.predict_fn, sampled_X, feature_names=truncated_feature_names
-                )
-
-        _logger.info(f"Shap explainer {explainer.__class__.__name__} is used.")
-
-        shap_values = explainer(sampled_X)
-
+                shap_values = explainer(sampled_X)
+        except Exception as e:
+            # Shap evaluation might fail on some edge cases, e.g., unsupported input data values
+            # or unsupported model on specific shap explainer. Catch exception to prevent it
+            # breaking the whole `evaluate` function.
+            _logger.warning(
+                f"Shap evaluation failed. Reason: {repr(e)}. "
+                "Set logging level to DEBUG to see the full traceback."
+            )
+            _logger.debug("", exc_info=True)
+            return
         try:
             mlflow.shap.log_explainer(
                 explainer, artifact_path=_gen_log_key("explainer", self.dataset_name)
@@ -421,7 +625,11 @@ class DefaultEvaluator(ModelEvaluator):
             # TODO: The explainer saver is buggy, if `get_underlying_model_flavor` return "unknown",
             #   then fallback to shap explainer saver, and shap explainer will call `model.save`
             #   for sklearn model, there is no `.save` method, so error will happen.
-            _logger.warning(f"Log explainer failed. Reason: {str(e)}")
+            _logger.warning(
+                f"Logging explainer failed. Reason: {repr(e)}."
+                "Set logging level to DEBUG to see the full traceback."
+            )
+            _logger.debug("", exc_info=True)
 
         def plot_beeswarm():
             pyplot.subplots_adjust(bottom=0.2, left=0.4)
@@ -449,6 +657,18 @@ class DefaultEvaluator(ModelEvaluator):
             plot_feature_importance,
             "shap_feature_importance_plot",
         )
+
+    def _evaluate_sklearn_model_score_if_scorable(self):
+        if self.model_loader_module == "mlflow.sklearn":
+            try:
+                score = self.raw_model.score(self.X, self.y)
+                self.metrics["score"] = score
+            except Exception as e:
+                _logger.warning(
+                    f"Computing sklearn model score failed: {repr(e)}. Set logging level to "
+                    "DEBUG to see the full traceback."
+                )
+                _logger.debug("", exc_info=True)
 
     def _log_binary_classifier(self):
         self.metrics.update(_get_classifier_per_class_metrics(self.y, self.y_pred))
@@ -489,17 +709,16 @@ class DefaultEvaluator(ModelEvaluator):
 
         log_roc_pr_curve = False
         if self.y_probs is not None:
-            max_num_classes_for_logging_curve = self.evaluator_config.get(
-                "max_num_classes_threshold_logging_roc_pr_curve_for_multiclass_classifier", 10
+            max_classes_for_multiclass_roc_pr = self.evaluator_config.get(
+                "max_classes_for_multiclass_roc_pr", 10
             )
-            if self.num_classes <= max_num_classes_for_logging_curve:
+            if self.num_classes <= max_classes_for_multiclass_roc_pr:
                 log_roc_pr_curve = True
             else:
                 _logger.warning(
-                    f"The classifier num_classes > {max_num_classes_for_logging_curve}, skip "
+                    f"The classifier num_classes > {max_classes_for_multiclass_roc_pr}, skip "
                     f"logging ROC curve and Precision-Recall curve. You can add evaluator config "
-                    f"'max_num_classes_threshold_logging_roc_pr_curve_for_multiclass_classifier' "
-                    f"to increase the threshold."
+                    f"'max_classes_for_multiclass_roc_pr' to increase the threshold."
                 )
 
         if log_roc_pr_curve:
@@ -532,6 +751,125 @@ class DefaultEvaluator(ModelEvaluator):
             per_class_metrics_collection_df["precision_recall_auc"] = pr_curve.auc
 
         self._log_pandas_df_artifact(per_class_metrics_collection_df, "per_class_metrics")
+
+    def _log_custom_metric_artifact(self, artifact_name, raw_artifact, custom_metric_tuple):
+        """
+        This function logs and returns a custom metric artifact. Two cases:
+            - The provided artifact is a path to a file, the function will make a copy of it with
+              a formatted name in a temporary directory and call mlflow.log_artifact.
+            - Otherwise: will attempt to save the artifact to an temporary path with an inferred
+              type. Then call mlflow.log_artifact.
+
+        :param artifact_name: the name of the artifact
+        :param raw_artifact:  the object representing the artifact
+        :param custom_metric_tuple: an instance of the _CustomMetric namedtuple
+        :return: EvaluationArtifact
+        """
+
+        exception_and_warning_header = (
+            f"Custom metric function '{custom_metric_tuple.name}' at index "
+            f"{custom_metric_tuple.index} in the `custom_metrics` parameter"
+        )
+
+        inferred_from_path, inferred_type, inferred_ext = _infer_artifact_type_and_ext(
+            artifact_name, raw_artifact, custom_metric_tuple
+        )
+        artifact_file_name = _gen_log_key(artifact_name, self.dataset_name) + inferred_ext
+        artifact_file_local_path = self.temp_dir.path(artifact_file_name)
+
+        if pathlib.Path(artifact_file_local_path).exists():
+            raise MlflowException(
+                f"{exception_and_warning_header} produced an artifact '{artifact_name}' that "
+                "cannot be logged because there already exists an artifact with the same name."
+            )
+
+        # ParquetEvaluationArtifact isn't explicitly stated here because such artifacts can only
+        # be supplied through file. Which is handled by the first if clause. This is because
+        # DataFrame objects default to be stored as CsvEvaluationArtifact.
+        if inferred_from_path:
+            shutil.copyfile(raw_artifact, artifact_file_local_path)
+        elif inferred_type is JsonEvaluationArtifact:
+            with open(artifact_file_local_path, "w") as f:
+                if isinstance(raw_artifact, str):
+                    f.write(raw_artifact)
+                else:
+                    json.dump(raw_artifact, f)
+        elif inferred_type is CsvEvaluationArtifact:
+            raw_artifact.to_csv(artifact_file_local_path, index=False)
+        elif inferred_type is NumpyEvaluationArtifact:
+            np.save(artifact_file_local_path, raw_artifact, allow_pickle=False)
+        elif inferred_type is ImageEvaluationArtifact:
+            raw_artifact.savefig(artifact_file_local_path)
+        else:
+            # storing as pickle
+            try:
+                with open(artifact_file_local_path, "wb") as f:
+                    pickle.dump(raw_artifact, f)
+                _logger.warning(
+                    f"{exception_and_warning_header} produced an artifact '{artifact_name}'"
+                    f" with type '{type(raw_artifact)}' that is logged as a pickle artifact."
+                )
+            except pickle.PickleError:
+                raise MlflowException(
+                    f"{exception_and_warning_header} produced an unsupported artifact "
+                    f"'{artifact_name}' with type '{type(raw_artifact)}' that cannot be pickled. "
+                    "Supported object types for artifacts are:\n"
+                    "- A string uri representing the file path to the artifact. MLflow"
+                    "  will infer the type of the artifact based on the file extension.\n"
+                    "- A string representation of a JSON object. This will be saved as a "
+                    ".json artifact.\n"
+                    "- Pandas DataFrame. This will be saved as a .csv artifact."
+                    "- Numpy array. This will be saved as a .npy artifact."
+                    "- Matplotlib Figure. This will be saved as an .png image artifact."
+                    "- Other objects will be attempted to be pickled with default protocol."
+                )
+
+        mlflow.log_artifact(artifact_file_local_path)
+        artifact = inferred_type(uri=mlflow.get_artifact_uri(artifact_file_name))
+        artifact._load(artifact_file_local_path)
+        return artifact
+
+    def _evaluate_custom_metrics_and_log_produced_artifacts(self):
+        if self.custom_metrics is None:
+            return
+        builtin_metrics = copy.deepcopy(self.metrics)
+        eval_df = pd.DataFrame(
+            {"prediction": copy.deepcopy(self.y_pred), "target": copy.deepcopy(self.y)}
+        )
+        for index, custom_metric in enumerate(self.custom_metrics):
+            with tempfile.TemporaryDirectory() as artifacts_dir:
+                custom_metric_tuple = _CustomMetric(
+                    function=custom_metric,
+                    index=index,
+                    name=getattr(custom_metric, "__name__", repr(custom_metric)),
+                    artifacts_dir=artifacts_dir,
+                )
+                # deepcopying eval_df and builtin_metrics for each custom metric function call,
+                # in case the user modifies them inside their function(s).
+                metric_results, artifact_results = _evaluate_custom_metric(
+                    custom_metric_tuple,
+                    eval_df.copy(),
+                    copy.deepcopy(builtin_metrics),
+                )
+                self.metrics.update(metric_results)
+                if artifact_results is not None:
+                    for artifact_name, raw_artifact in artifact_results.items():
+                        self.artifacts[artifact_name] = self._log_custom_metric_artifact(
+                            artifact_name,
+                            raw_artifact,
+                            custom_metric_tuple,
+                        )
+
+    def _log_and_return_evaluation_result(self):
+        """
+        This function logs all of the produced metrics and artifacts (including custom metrics)
+        along with model explainability. Then, returns an instance of EvaluationResult.
+        :return:
+        """
+        self._evaluate_custom_metrics_and_log_produced_artifacts()
+        self._log_metrics()
+        self._log_model_explainability()
+        return EvaluationResult(self.metrics, self.artifacts)
 
     def _evaluate_classifier(self):
         from mlflow.models.evaluation.lift_curve import plot_lift_curve
@@ -574,6 +912,7 @@ class DefaultEvaluator(ModelEvaluator):
                 self.is_binomial, self.y, self.y_pred, self.y_probs, self.label_list
             )
         )
+        self._evaluate_sklearn_model_score_if_scorable()
 
         if self.is_binomial:
             self._log_binary_classifier()
@@ -592,10 +931,20 @@ class DefaultEvaluator(ModelEvaluator):
         )
 
         def plot_confusion_matrix():
-            sk_metrics.ConfusionMatrixDisplay(
-                confusion_matrix=confusion_matrix,
-                display_labels=self.label_list,
-            ).plot(cmap="Blues")
+            import matplotlib
+            import matplotlib.pyplot as plt
+
+            with matplotlib.rc_context(
+                {
+                    "font.size": min(8, math.ceil(50.0 / self.num_classes)),
+                    "axes.labelsize": 8,
+                }
+            ):
+                _, ax = plt.subplots(1, 1, figsize=(6.0, 4.0), dpi=175)
+                sk_metrics.ConfusionMatrixDisplay(
+                    confusion_matrix=confusion_matrix,
+                    display_labels=self.label_list,
+                ).plot(cmap="Blues", ax=ax)
 
         if hasattr(sk_metrics, "ConfusionMatrixDisplay"):
             self._log_image_artifact(
@@ -603,17 +952,14 @@ class DefaultEvaluator(ModelEvaluator):
                 "confusion_matrix",
             )
 
-        self._log_metrics()
-        self._log_model_explainability()
-        return EvaluationResult(self.metrics, self.artifacts)
+        return self._log_and_return_evaluation_result()
 
     def _evaluate_regressor(self):
         self.y_pred = self.model.predict(self.X)
         self.metrics.update(_get_regressor_metrics(self.y, self.y_pred))
+        self._evaluate_sklearn_model_score_if_scorable()
 
-        self._log_metrics()
-        self._log_model_explainability()
-        return EvaluationResult(self.metrics, self.artifacts)
+        return self._log_and_return_evaluation_result()
 
     def evaluate(
         self,
@@ -623,6 +969,7 @@ class DefaultEvaluator(ModelEvaluator):
         dataset,
         run_id,
         evaluator_config,
+        custom_metrics=None,
         **kwargs,
     ):
         import matplotlib
@@ -638,6 +985,7 @@ class DefaultEvaluator(ModelEvaluator):
             self.evaluator_config = evaluator_config
             self.dataset_name = dataset.name
             self.feature_names = dataset.feature_names
+            self.custom_metrics = custom_metrics
 
             (
                 model_loader_module,
@@ -652,21 +1000,22 @@ class DefaultEvaluator(ModelEvaluator):
 
             self.X = dataset.features_data
             self.y = dataset.labels_data
-            self.metrics = EvaluationMetrics()
+            self.metrics = dict()
             self.artifacts = {}
 
-            infered_model_type = _infer_model_type_by_labels(self.y)
+            inferred_model_type = _infer_model_type_by_labels(self.y)
 
-            if model_type != infered_model_type:
+            if inferred_model_type is not None and model_type != inferred_model_type:
                 _logger.warning(
                     f"According to the evaluation dataset label values, the model type looks like "
-                    f"{infered_model_type}, but you specified model type {model_type}. Please "
+                    f"{inferred_model_type}, but you specified model type {model_type}. Please "
                     f"verify that you set the `model_type` and `dataset` arguments correctly."
                 )
 
-            if model_type == "classifier":
-                return self._evaluate_classifier()
-            elif model_type == "regressor":
-                return self._evaluate_regressor()
-            else:
-                raise ValueError(f"Unsupported model type {model_type}")
+            with mlflow.utils.autologging_utils.disable_autologging():
+                if model_type == "classifier":
+                    return self._evaluate_classifier()
+                elif model_type == "regressor":
+                    return self._evaluate_regressor()
+                else:
+                    raise ValueError(f"Unsupported model type {model_type}")

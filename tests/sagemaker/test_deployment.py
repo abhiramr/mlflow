@@ -86,7 +86,7 @@ def mock_sagemaker_aws_services(fn):
         iam_client = boto3.client("iam", region_name="us-west-2")
         iam_client.create_role(RoleName="moto", AssumeRolePolicyDocument=role_policy)
 
-        # Create IAM role to be asssumed (could be in another AWS account)
+        # Create IAM role to be assumed (could be in another AWS account)
         iam_client.create_role(RoleName="assumed_role", AssumeRolePolicyDocument=role_policy)
         return fn(*args, **kwargs)
 
@@ -108,7 +108,14 @@ def test_assume_role_and_get_credentials():
     assert len(assumed_role_credentials["aws_secret_access_key"]) == 40
 
 
-@pytest.mark.large
+@pytest.mark.parametrize("arn", [None, ""])
+def test_assume_role_and_get_credentials_with_empty_arn(arn):
+    assumed_role_credentials = mfs._assume_role_and_get_credentials(assume_role_arn=arn)
+
+    assert isinstance(assumed_role_credentials, dict)
+    assert len(assumed_role_credentials) == 0
+
+
 @mock_sagemaker_aws_services
 def test_deployment_with_non_existent_assume_role_arn_raises_exception(pretrained_model):
 
@@ -124,7 +131,6 @@ def test_deployment_with_non_existent_assume_role_arn_raises_exception(pretraine
         )
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deployment_with_assume_role_arn(pretrained_model, sagemaker_client):
     app_name = "deploy_with_assume_role_arn"
@@ -138,7 +144,6 @@ def test_deployment_with_assume_role_arn(pretrained_model, sagemaker_client):
     ]
 
 
-@pytest.mark.large
 def test_deployment_with_unsupported_flavor_raises_exception(pretrained_model):
     unsupported_flavor = "this is not a valid flavor"
     match = "The specified flavor: `this is not a valid flavor` is not supported for deployment"
@@ -150,7 +155,6 @@ def test_deployment_with_unsupported_flavor_raises_exception(pretrained_model):
     assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
-@pytest.mark.large
 def test_deployment_with_missing_flavor_raises_exception(pretrained_model):
     missing_flavor = "mleap"
     match = "The specified model does not contain the specified deployment flavor"
@@ -162,7 +166,6 @@ def test_deployment_with_missing_flavor_raises_exception(pretrained_model):
     assert exc.value.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST)
 
 
-@pytest.mark.large
 def test_deployment_of_model_with_no_supported_flavors_raises_exception(pretrained_model):
     logged_model_path = _download_artifact_from_uri(pretrained_model.model_uri)
     model_config_path = os.path.join(logged_model_path, "MLmodel")
@@ -177,7 +180,6 @@ def test_deployment_of_model_with_no_supported_flavors_raises_exception(pretrain
     assert exc.value.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST)
 
 
-@pytest.mark.large
 def test_validate_deployment_flavor_validates_python_function_flavor_successfully(pretrained_model):
     model_config_path = os.path.join(
         _download_artifact_from_uri(pretrained_model.model_uri), "MLmodel"
@@ -186,7 +188,6 @@ def test_validate_deployment_flavor_validates_python_function_flavor_successfull
     mfs._validate_deployment_flavor(model_config=model_config, flavor=mlflow.pyfunc.FLAVOR_NAME)
 
 
-@pytest.mark.large
 def test_get_preferred_deployment_flavor_obtains_valid_flavor_from_model(pretrained_model):
     model_config_path = os.path.join(
         _download_artifact_from_uri(pretrained_model.model_uri), "MLmodel"
@@ -199,7 +200,6 @@ def test_get_preferred_deployment_flavor_obtains_valid_flavor_from_model(pretrai
     assert selected_flavor in model_config.flavors
 
 
-@pytest.mark.large
 def test_attempting_to_deploy_in_asynchronous_mode_without_archiving_throws_exception(
     pretrained_model,
 ):
@@ -215,7 +215,6 @@ def test_attempting_to_deploy_in_asynchronous_mode_without_archiving_throws_exce
     assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_creates_sagemaker_and_s3_resources_with_expected_names_and_env_from_local(
     pretrained_model, sagemaker_client
@@ -236,12 +235,10 @@ def test_deploy_creates_sagemaker_and_s3_resources_with_expected_names_and_env_f
     object_names = [
         entry["Key"] for entry in s3_client.list_objects(Bucket=default_bucket)["Contents"]
     ]
-    assert any([model_name in object_name for object_name in object_names])
+    assert any(model_name in object_name for object_name in object_names)
     assert any(
-        [
-            app_name in config["EndpointConfigName"]
-            for config in sagemaker_client.list_endpoint_configs()["EndpointConfigs"]
-        ]
+        app_name in config["EndpointConfigName"]
+        for config in sagemaker_client.list_endpoint_configs()["EndpointConfigs"]
     )
     assert app_name in [
         endpoint["EndpointName"] for endpoint in sagemaker_client.list_endpoints()["Endpoints"]
@@ -255,7 +252,6 @@ def test_deploy_creates_sagemaker_and_s3_resources_with_expected_names_and_env_f
     }
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_env_from_local(
     pretrained_model, sagemaker_client
@@ -286,12 +282,10 @@ def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_e
     object_names = [
         entry["Key"] for entry in s3_client.list_objects(Bucket=default_bucket)["Contents"]
     ]
-    assert any([model_name in object_name for object_name in object_names])
+    assert any(model_name in object_name for object_name in object_names)
     assert any(
-        [
-            app_name in config["EndpointConfigName"]
-            for config in sagemaker_client.list_endpoint_configs()["EndpointConfigs"]
-        ]
+        app_name in config["EndpointConfigName"]
+        for config in sagemaker_client.list_endpoint_configs()["EndpointConfigs"]
     )
     assert app_name in [
         endpoint["EndpointName"] for endpoint in sagemaker_client.list_endpoints()["Endpoints"]
@@ -305,7 +299,6 @@ def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_e
     }
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_creates_sagemaker_and_s3_resources_with_expected_names_and_env_from_s3(
     pretrained_model, sagemaker_client
@@ -333,12 +326,10 @@ def test_deploy_creates_sagemaker_and_s3_resources_with_expected_names_and_env_f
     object_names = [
         entry["Key"] for entry in s3_client.list_objects(Bucket=default_bucket)["Contents"]
     ]
-    assert any([model_name in object_name for object_name in object_names])
+    assert any(model_name in object_name for object_name in object_names)
     assert any(
-        [
-            app_name in config["EndpointConfigName"]
-            for config in sagemaker_client.list_endpoint_configs()["EndpointConfigs"]
-        ]
+        app_name in config["EndpointConfigName"]
+        for config in sagemaker_client.list_endpoint_configs()["EndpointConfigs"]
     )
     assert app_name in [
         endpoint["EndpointName"] for endpoint in sagemaker_client.list_endpoints()["Endpoints"]
@@ -352,7 +343,6 @@ def test_deploy_creates_sagemaker_and_s3_resources_with_expected_names_and_env_f
     }
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_env_from_s3(
     pretrained_model, sagemaker_client
@@ -385,12 +375,10 @@ def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_e
     object_names = [
         entry["Key"] for entry in s3_client.list_objects(Bucket=default_bucket)["Contents"]
     ]
-    assert any([model_name in object_name for object_name in object_names])
+    assert any(model_name in object_name for object_name in object_names)
     assert any(
-        [
-            app_name in config["EndpointConfigName"]
-            for config in sagemaker_client.list_endpoint_configs()["EndpointConfigs"]
-        ]
+        app_name in config["EndpointConfigName"]
+        for config in sagemaker_client.list_endpoint_configs()["EndpointConfigs"]
     )
     assert app_name in [
         endpoint["EndpointName"] for endpoint in sagemaker_client.list_endpoints()["Endpoints"]
@@ -404,7 +392,6 @@ def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_e
     }
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploying_application_with_preexisting_name_in_create_mode_throws_exception(
     pretrained_model,
@@ -424,7 +411,6 @@ def test_deploying_application_with_preexisting_name_in_create_mode_throws_excep
     assert exc.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_in_synchronous_mode_waits_for_endpoint_creation_to_complete_before_returning(
     pretrained_model, sagemaker_client
@@ -449,7 +435,6 @@ def test_deploy_in_synchronous_mode_waits_for_endpoint_creation_to_complete_befo
     assert endpoint_description["EndpointStatus"] == Endpoint.STATUS_IN_SERVICE
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_create_in_asynchronous_mode_returns_before_endpoint_creation_completes(
     pretrained_model, sagemaker_client
@@ -475,7 +460,6 @@ def test_deploy_create_in_asynchronous_mode_returns_before_endpoint_creation_com
     assert endpoint_description["EndpointStatus"] == Endpoint.STATUS_CREATING
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_replace_in_asynchronous_mode_returns_before_endpoint_creation_completes(
     pretrained_model, sagemaker_client
@@ -508,7 +492,6 @@ def test_deploy_replace_in_asynchronous_mode_returns_before_endpoint_creation_co
     assert endpoint_description["EndpointStatus"] == Endpoint.STATUS_UPDATING
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_in_create_mode_throws_exception_after_endpoint_creation_fails(
     pretrained_model, sagemaker_client
@@ -549,7 +532,6 @@ def test_deploy_in_create_mode_throws_exception_after_endpoint_creation_fails(
     assert exc.value.error_code == ErrorCode.Name(INTERNAL_ERROR)
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_in_add_mode_adds_new_model_to_existing_endpoint(pretrained_model, sagemaker_client):
     app_name = "test-app"
@@ -576,7 +558,6 @@ def test_deploy_in_add_mode_adds_new_model_to_existing_endpoint(pretrained_model
     assert len(production_variants) == models_added
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_in_replace_model_removes_preexisting_models_from_endpoint(
     pretrained_model, sagemaker_client
@@ -632,14 +613,11 @@ def test_deploy_in_replace_model_removes_preexisting_models_from_endpoint(
     ]
     assert len(deployed_models_after_replacement) == 1
     assert all(
-        [
-            model_name not in deployed_models_after_replacement
-            for model_name in deployed_models_before_replacement
-        ]
+        model_name not in deployed_models_after_replacement
+        for model_name in deployed_models_before_replacement
     )
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_in_replace_mode_throws_exception_after_endpoint_update_fails(
     pretrained_model, sagemaker_client
@@ -684,7 +662,6 @@ def test_deploy_in_replace_mode_throws_exception_after_endpoint_update_fails(
     assert exc.value.error_code == ErrorCode.Name(INTERNAL_ERROR)
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_in_replace_mode_waits_for_endpoint_update_completion_before_deleting_resources(
     pretrained_model, sagemaker_client
@@ -730,7 +707,6 @@ def test_deploy_in_replace_mode_waits_for_endpoint_update_completion_before_dele
         )
 
 
-@pytest.mark.large
 @mock_sagemaker_aws_services
 def test_deploy_in_replace_mode_with_archiving_does_not_delete_resources(
     pretrained_model, sagemaker_client
@@ -786,15 +762,11 @@ def test_deploy_in_replace_mode_with_archiving_does_not_delete_resources(
         model["ModelName"] for model in sagemaker_client.list_models()["Models"]
     ]
     assert all(
-        [
-            object_name in object_names_after_replacement
-            for object_name in object_names_before_replacement
-        ]
+        object_name in object_names_after_replacement
+        for object_name in object_names_before_replacement
     )
     assert all(
-        [
-            endpoint_config in endpoint_configs_after_replacement
-            for endpoint_config in endpoint_configs_before_replacement
-        ]
+        endpoint_config in endpoint_configs_after_replacement
+        for endpoint_config in endpoint_configs_before_replacement
     )
-    assert all([model in models_after_replacement for model in models_before_replacement])
+    assert all(model in models_after_replacement for model in models_before_replacement)
